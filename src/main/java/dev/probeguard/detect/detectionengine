@@ -1,0 +1,118 @@
+package dev.probeguard.detect;
+
+import dev.probeguard.ProbeGuardPlugin;
+import dev.probeguard.config.Settings;
+import dev.probeguard.profile.ClientProfile;
+import org.bukkit.Bukkit;
+import org.bukkit.entity.Player;
+
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+public final class DetectionEngine {
+
+    private final ProbeGuardPlugin plugin;
+    private final Map<UUID, Long> lastRescan = new ConcurrentHashMap<>();
+
+    public DetectionEngine(ProbeGuardPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    /**
+     * Debounces bursts (a client can send several plugin messages in one tick)
+     * and hops to the main thread, because checks read Bukkit config and the
+     * response stage touches the player.
+     */
+    public void scheduleRescan(UUID uuid) {
+        if (!plugin.isEnabled()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        Long previous = lastRescan.put(uuid, now);
+        if (previous != null && now - previous < 250L) {
+            return;
+        }
+        Bukkit.getScheduler().runTask(plugin, () -> rescan(uuid));
+    }
+
+    public void rescan(UUID uuid) {
+        ClientProfile profile = plugin.profiles().peek(uuid);
+        if (profile == null) {
+            return;
+        }
+        for (Checks.Finding finding : Checks.run(plugin, profile)) {
+            record(uuid, finding.type(), finding.detail(), finding.weight());
+        }
+        scheduleEvaluate(uuid);
+    }
+
+    public void report(UUID uuid, ViolationType type, String detail, int weight) {
+        record(uuid, type, detail, weight);
+        scheduleEvaluate(uuid);
+    }
+
+    private void record(UUID uuid, ViolationType type, String detail, int weight) {
+        ClientProfile profile = plugin.profiles().peek(uuid);
+        if (profile == null) {
+            return;
+        }
+        Violation violation = new Violation(type, detail, weight, System.currentTimeMillis());
+        if (profile.addViolation(violation)) {
+            plugin.debug("[detect] " + display(profile) + " " + type.key() + " :: " + detail + " (+" + weight + ")");
+        }
+    }
+
+    private void scheduleEvaluate(UUID uuid) {
+        if (!plugin.isEnabled()) {
+            return;
+        }
+        Bukkit.getScheduler().runTask(plugin, () -> evaluate(uuid));
+    }
+
+    public void evaluate(UUID uuid) {
+        ClientProfile profile = plugin.profiles().peek(uuid);
+        if (profile == null) {
+            return;
+        }
+        Player player = Bukkit.getPlayer(uuid);
+        if (player == null || !player.isOnline() || player.hasPermission("probeguard.bypass")) {
+            return;
+        }
+
+        int score = score(profile);
+        if (score <= 0) {
+            return;
+        }
+
+        Settings.Response response = plugin.settings().response;
+        if (score >= response.alertScore && score > profile.alertedScore()) {
+            profile.setAlertedScore(score);
+            plugin.responses().alert(profile, score);
+            plugin.responses().discord(profile, score, false);
+        }
+
+        if (response.kickScore > 0 && score >= response.kickScore && !profile.punished()) {
+            profile.setPunished(true);
+            plugin.responses().punish(profile, score);
+        }
+    }
+
+    public int score(ClientProfile profile) {
+        int total = 0;
+        for (Violation violation : profile.violations()) {
+            total += violation.weight();
+        }
+        return total;
+    }
+
+    public void forget(UUID uuid) {
+        lastRescan.remove(uuid);
+    }
+
+    private static String display(ClientProfile profile) {
+        return profile.name() == null || profile.name().isBlank()
+                ? profile.uuid().toString()
+                : profile.name();
+    }
+}
