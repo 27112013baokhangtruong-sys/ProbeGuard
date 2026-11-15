@@ -1,0 +1,119 @@
+package dev.probeguard.detect;
+
+import com.github.retrooper.packetevents.protocol.player.User;
+import com.github.retrooper.packetevents.wrapper.play.server.WrapperPlayServerPluginMessage;
+import dev.probeguard.ProbeGuardPlugin;
+import dev.probeguard.config.Settings;
+import dev.probeguard.profile.ClientProfile;
+import org.bukkit.Bukkit;
+import org.bukkit.entity.Player;
+
+import java.util.Locale;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Behaviour probe #2 (opt-in).
+ *
+ * <p>Sends a plugin message on a channel a mod is known to answer. Two signals
+ * are produced:</p>
+ * <ul>
+ *     <li>{@code expect-reply: true} + no answer in time = the client is hiding
+ *     a mod it should be running (or is not running what it claims);</li>
+ *     <li>a reply on a channel listed in {@code flag-replies-on} = a mod is
+ *     talking to the server even though the brand does not mention it.</li>
+ * </ul>
+ */
+public final class EchoProbe {
+
+    private final ProbeGuardPlugin plugin;
+    private final Map<UUID, Map<String, Long>> awaiting = new ConcurrentHashMap<>();
+
+    public EchoProbe(ProbeGuardPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    public void schedule(Player player, int delayTicks) {
+        if (!plugin.settings().echo.enabled || !plugin.isEnabled()) {
+            return;
+        }
+        Bukkit.getScheduler().runTaskLater(plugin, () -> start(player), Math.max(0, delayTicks));
+    }
+
+    private void start(Player player) {
+        if (!player.isOnline()) {
+            return;
+        }
+        ClientProfile profile = plugin.profiles().peek(player.getUniqueId());
+        if (profile == null) {
+            return;
+        }
+        if (profile.bedrock() && plugin.settings().probe.bedrockBypass) {
+            return;
+        }
+        User user = profile.user();
+        if (user == null) {
+            return;
+        }
+
+        Settings.Echo cfg = plugin.settings().echo;
+        long now = System.currentTimeMillis();
+        Map<String, Long> pending = new ConcurrentHashMap<>();
+
+        for (Settings.EchoProbe probe : cfg.probes) {
+            try {
+                user.sendPacket(new WrapperPlayServerPluginMessage(probe.channel(), probe.payload()));
+            } catch (Throwable failure) {
+                plugin.debug("echo: failed to send on " + probe.channel() + ": " + failure);
+                continue;
+            }
+            if (probe.expectReply()) {
+                pending.put(probe.channel().toLowerCase(Locale.ROOT), now + probe.timeoutMs());
+            }
+        }
+
+        if (!pending.isEmpty()) {
+            awaiting.put(player.getUniqueId(), pending);
+        }
+    }
+
+    /** Called from the PacketEvents netty thread. */
+    public void onClientMessage(UUID uuid, String channel) {
+        String normalized = channel.toLowerCase(Locale.ROOT);
+
+        Map<String, Long> pending = awaiting.get(uuid);
+        if (pending != null) {
+            pending.remove(normalized);
+        }
+
+        Settings.Echo cfg = plugin.settings().echo;
+        for (String prefix : cfg.flagReplyPrefixes) {
+            if (normalized.startsWith(prefix)) {
+                plugin.engine().report(uuid, ViolationType.ECHO_MOD_REPLY, channel, cfg.weight);
+                break;
+            }
+        }
+    }
+
+    public void tick() {
+        long now = System.currentTimeMillis();
+        Settings.Echo cfg = plugin.settings().echo;
+        awaiting.forEach((uuid, pending) -> pending.entrySet().removeIf(entry -> {
+            if (now > entry.getValue()) {
+                plugin.engine().report(uuid, ViolationType.ECHO_NO_REPLY,
+                        "no reply on " + entry.getKey(), cfg.weight);
+                return true;
+            }
+            return false;
+        }));
+    }
+
+    public void remove(UUID uuid) {
+        awaiting.remove(uuid);
+    }
+
+    public void clear() {
+        awaiting.clear();
+    }
+}
