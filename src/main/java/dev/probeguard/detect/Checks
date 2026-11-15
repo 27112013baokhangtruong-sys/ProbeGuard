@@ -1,0 +1,222 @@
+package dev.probeguard.detect;
+
+import dev.probeguard.ProbeGuardPlugin;
+import dev.probeguard.config.Settings;
+import dev.probeguard.profile.ClientProfile;
+import dev.probeguard.util.Text;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Pattern;
+
+/**
+ * The passive checks: everything that can be decided from data the client has
+ * already sent (brand, registered channels, handshake markers, client settings).
+ * Behaviour probes live in {@link PingProbe} and {@link EchoProbe}.
+ */
+public final class Checks {
+
+    private Checks() {
+    }
+
+    public record Finding(ViolationType type, String detail, int weight) {
+    }
+
+    public static List<Finding> run(ProbeGuardPlugin plugin, ClientProfile profile) {
+        Settings settings = plugin.settings();
+        List<Finding> findings = new ArrayList<>();
+        String brand = normalizeBrand(profile.rawBrand());
+
+        if (settings.brand.enabled) {
+            brand(settings.brand, profile, brand, findings);
+        }
+        if (settings.channels.enabled) {
+            channels(settings.channels, profile, brand, findings);
+        }
+        if (settings.handshake.enabled) {
+            handshake(settings.handshake, profile, brand, findings);
+        }
+        if (settings.settingsCheck.enabled) {
+            settings(settings.settingsCheck, profile, findings);
+        }
+        if (settings.bedrock.enabled) {
+            bedrock(settings.bedrock, profile, findings);
+        }
+        return findings;
+    }
+
+    public static String normalizeBrand(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        return raw.replaceAll("[\\p{Cntrl}]", "").trim().toLowerCase(Locale.ROOT);
+    }
+
+    // ------------------------------------------------------------------ brand
+
+    private static void brand(Settings.Brand cfg, ClientProfile profile, String brand, List<Finding> out) {
+        String raw = profile.rawBrand();
+
+        if (brand.isEmpty()) {
+            if (!cfg.allowEmpty) {
+                out.add(new Finding(ViolationType.BRAND_EMPTY, "client did not send a brand", cfg.weight));
+            }
+            return;
+        }
+
+        String cleaned = raw.replaceAll("[\\p{Cntrl}]", "").trim();
+        if (!cleaned.equals(raw)) {
+            out.add(new Finding(ViolationType.BRAND_MALFORMED,
+                    "brand has whitespace/control characters: '" + Text.escape(raw) + "'", cfg.weight));
+        }
+
+        for (Pattern pattern : cfg.blacklist) {
+            if (pattern.matcher(brand).find()) {
+                out.add(new Finding(ViolationType.BRAND_BLACKLISTED, Text.escape(brand), cfg.weight));
+                return;
+            }
+        }
+
+        if (!cfg.whitelist.isEmpty()
+                && !cfg.vanillaAliases.contains(brand)
+                && cfg.whitelist.stream().noneMatch(p -> p.matcher(brand).find())) {
+            out.add(new Finding(ViolationType.BRAND_NOT_WHITELISTED, Text.escape(brand), cfg.weight));
+        }
+    }
+
+    // ------------------------------------------------------------------ channels
+
+    private static void channels(Settings.Channels cfg, ClientProfile profile, String brand, List<Finding> out) {
+        Set<String> all = allChannels(profile);
+
+        for (Pattern ignore : cfg.ignore) {
+            all.removeIf(c -> ignore.matcher(c).find());
+        }
+
+        List<String> blocked = all.stream()
+                .filter(c -> cfg.blacklist.stream().anyMatch(p -> p.matcher(c).find()))
+                .sorted()
+                .toList();
+        if (!blocked.isEmpty()) {
+            out.add(new Finding(ViolationType.CHANNEL_BLOCKED, join(blocked, 6), cfg.weight));
+        }
+
+        boolean flaggedVanilla = false;
+        if (cfg.vanillaBrands.contains(brand)) {
+            List<String> modChannels = all.stream()
+                    .filter(c -> isModChannel(c, cfg))
+                    .sorted()
+                    .toList();
+            if (!modChannels.isEmpty()) {
+                out.add(new Finding(ViolationType.VANILLA_WITH_MOD_CHANNELS, join(modChannels, 6), cfg.weight));
+                flaggedVanilla = true;
+            }
+        }
+
+        if (!flaggedVanilla) {
+            List<String> unknown = all.stream()
+                    .filter(c -> !cfg.allowedNamespaces.contains(namespace(c)))
+                    .filter(c -> cfg.whitelist.stream().noneMatch(p -> p.matcher(c).find()))
+                    .sorted()
+                    .toList();
+            if (!unknown.isEmpty()) {
+                out.add(new Finding(ViolationType.CHANNEL_UNKNOWN_NAMESPACE,
+                        join(unknown, 6), Math.max(1, cfg.weight - 2)));
+            }
+        }
+    }
+
+    private static boolean isModChannel(String channel, Settings.Channels cfg) {
+        String namespace = namespace(channel);
+        if (namespace.equals("minecraft")) {
+            return false;
+        }
+        return !cfg.allowedNamespaces.contains(namespace);
+    }
+
+    // ------------------------------------------------------------------ handshake
+
+    private static void handshake(Settings.Handshake cfg, ClientProfile profile, String brand, List<Finding> out) {
+        if (profile.ageMs() < cfg.graceMs) {
+            return;
+        }
+
+        Set<String> all = allChannels(profile);
+        boolean hasModChannel = all.stream()
+                .anyMatch(c -> cfg.modPrefixes.stream().anyMatch(c::startsWith));
+        if (!hasModChannel) {
+            return;
+        }
+
+        boolean claimsVanilla = brand.isEmpty() || cfg.vanillaBrands.contains(brand);
+        if (claimsVanilla) {
+            out.add(new Finding(ViolationType.HANDSHAKE_MISMATCH,
+                    "brand '" + (brand.isEmpty() ? "none" : Text.escape(brand)) + "' but mod handshake channels are present",
+                    cfg.weight));
+        }
+    }
+
+    // ------------------------------------------------------------------ settings
+
+    private static void settings(Settings.SettingsCheck cfg, ClientProfile profile, List<Finding> out) {
+        ClientProfile.ClientSettings client = profile.settings();
+        if (client == null) {
+            return;
+        }
+
+        List<String> issues = new ArrayList<>();
+        if (client.viewDistance() < cfg.minViewDistance || client.viewDistance() > cfg.maxViewDistance) {
+            issues.add("view-distance=" + client.viewDistance());
+        }
+        if (cfg.localePattern != null
+                && (client.locale() == null || !cfg.localePattern.matcher(client.locale()).matches())) {
+            issues.add("locale=" + client.locale());
+        }
+        if (client.skinMask() < 0 || client.skinMask() > 127) {
+            issues.add("skin-mask=" + client.skinMask());
+        }
+        if (client.chatVisibility() == null || client.mainHand() == null) {
+            issues.add("missing settings fields");
+        }
+        if (!issues.isEmpty()) {
+            out.add(new Finding(ViolationType.SETTINGS_ANOMALY, String.join(", ", issues), cfg.weight));
+        }
+    }
+
+    // ------------------------------------------------------------------ bedrock
+
+    private static void bedrock(Settings.Bedrock cfg, ClientProfile profile, List<Finding> out) {
+        if (profile.bedrock()) {
+            return;
+        }
+        String name = profile.name();
+        if (!cfg.prefix.isEmpty() && name != null && name.startsWith(cfg.prefix)) {
+            out.add(new Finding(ViolationType.BEDROCK_SPOOF,
+                    "Bedrock prefix '" + cfg.prefix + "' without Floodgate data", cfg.weight));
+        }
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    private static Set<String> allChannels(ClientProfile profile) {
+        Set<String> all = new HashSet<>(profile.channels());
+        all.addAll(profile.registeredChannels());
+        all.removeIf(String::isBlank);
+        return all;
+    }
+
+    private static String namespace(String channel) {
+        int index = channel.indexOf(':');
+        return index < 0 ? "" : channel.substring(0, index);
+    }
+
+    private static String join(List<String> values, int max) {
+        if (values.size() <= max) {
+            return String.join(", ", values);
+        }
+        return String.join(", ", values.subList(0, max)) + " (+" + (values.size() - max) + " more)";
+    }
+}
